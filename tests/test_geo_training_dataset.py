@@ -1,6 +1,7 @@
 import json
 import shutil
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,7 +19,9 @@ from lewm_drone import (
     SourceProvenance,
     TemporalWindow,
     TrajectoryStep,
+    UAVObservation,
     UncertaintyLayer,
+    VectorLayer,
     build_geo_training_dataset,
     read_canonical_geospatial_manifest,
 )
@@ -146,6 +149,69 @@ class GeoTrainingDatasetBuilderTest(unittest.TestCase):
         self.assertEqual(loaded.dataset_id, manifest.dataset_id)
         self.assertEqual(loaded.aoi.aoi_id, manifest.aoi.aoi_id)
         self.assertEqual(loaded.orthomosaic_tiles[0].tile_id, "ortho-geo-json")
+
+    def test_sparse_uav_and_hydro_vector_are_planned_as_training_layers(self):
+        timestamp_s = _ts(2026, 10, 1)
+        manifest = _synthetic_manifest(
+            "geo-uav-hydro",
+            "aoi-uav-hydro",
+            x_offset=0.0,
+            timestamp_s=timestamp_s,
+            mission_id="mission-uav-hydro",
+            sensor_id="sensor-uav-hydro",
+        )
+        hydro = VectorLayer(
+            layer_id="hydro-vector",
+            layer_type="hydro",
+            uri="memory://hydro-vector",
+            geometry_type="LineString",
+            crs=manifest.crs,
+            temporal_window=manifest.temporal_window,
+            attributes=("feature_type",),
+            provenance=_provenance("hydro-vector-source"),
+            data_age=_age(timestamp_s),
+        )
+        uav = UAVObservation(
+            observation_id="uav-frame-001",
+            timestamp_s=timestamp_s,
+            platform_id="sensor-uav-hydro",
+            frame_uri="memory://uav-frame-001",
+            crs=manifest.crs,
+            pose={"x_m": 1.0, "y_m": 1.0, "z_m": 120.0},
+            telemetry={"battery_percent": 90.0},
+            camera={"channels": 3, "width_px": 640, "height_px": 480},
+            provenance=_provenance("uav-frame-source"),
+            data_age=_age(timestamp_s),
+        )
+        trajectory = replace(
+            manifest.trajectory[0],
+            observation_id="uav-frame-001",
+        )
+        manifest = replace(
+            manifest,
+            vector_layers=(hydro,),
+            uav_observations=(uav,),
+            trajectory=(trajectory,),
+        )
+
+        plan = build_geo_training_dataset(
+            [manifest],
+            config=GeoTrainingDatasetBuildConfig(
+                tile=GeoTrainingTileSpec(width_px=10, height_px=10, resolution_m=1.0),
+                split_fractions={"train": 1.0, "val": 0.0, "test": 0.0},
+            ),
+            dry_run=True,
+        )
+
+        sample = plan.samples[0]
+        self.assertEqual(sample.training_keys["pixels"], ["uav-frame-001"])
+        self.assertEqual(sample.training_keys["sparse_uav_frames"], ["uav-frame-001"])
+        self.assertIn("hydro-vector", sample.training_keys["geo_layers"])
+        self.assertEqual(sample.training_keys["vector_layers"], ["hydro-vector"])
+        self.assertIn(
+            "time_aligned_sparse_observation",
+            {alignment.reason for alignment in sample.alignments},
+        )
 
 
 def _synthetic_manifest(

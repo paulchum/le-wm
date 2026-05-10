@@ -710,7 +710,7 @@ def _to_raster_layer(layer: GeoLayerManifest) -> RasterLayer:
             height_px=height_px,
             resolution_m=resolution_m,
             origin_x=layer.bounds.min_x,
-            origin_y=layer.bounds.max_y,
+            origin_y=layer.bounds.min_y,
             crs=layer.crs,
         ),
         temporal_window=TemporalWindow(
@@ -740,7 +740,10 @@ def _to_vector_layer(layer: GeoLayerManifest) -> VectorLayer:
         attributes=tuple(str(field) for field in layer.metadata.get("fields", ())),
         provenance=_source_provenance(layer),
         data_age=_data_age(layer),
-        metadata={"ingestion": layer.to_record()},
+        metadata={
+            "bounds": layer.bounds,
+            "ingestion": layer.to_record(),
+        },
     )
 
 
@@ -756,7 +759,7 @@ def _to_orthomosaic_tile(layer: GeoLayerManifest) -> OrthomosaicTile:
             height_px=height_px,
             resolution_m=_canonical_resolution_m(layer),
             origin_x=layer.bounds.min_x,
-            origin_y=layer.bounds.max_y,
+            origin_y=layer.bounds.min_y,
             crs=layer.crs,
         ),
         temporal_window=TemporalWindow(

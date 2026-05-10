@@ -34,16 +34,27 @@ from .interfaces import JsonValue, to_jsonable
 
 DEFAULT_GEO_TRAINING_KEYS = (
     "pixels",
+    "orthomosaic",
+    "sparse_uav_frames",
     "action",
     "proprio",
     "proprioception",
     "geo_layers",
+    "static_geo_layers",
+    "dynamic_geo_layers",
+    "vector_layers",
     "uncertainty",
     "timestamps",
     "source_ids",
+    "geo_layer_types",
+    "geo_layer_channels",
     "geo_layer_available",
     "unavailable_layer_mask",
 )
+
+STATIC_GEO_LAYER_TYPES = frozenset({"dem", "elevation", "dtm", "dsm", "land_cover", "hydro"})
+DYNAMIC_GEO_LAYER_TYPES = frozenset({"weather", "ice"})
+VECTOR_GEO_LAYER_TYPES = frozenset({"hydro"})
 
 
 @dataclass(frozen=True)
@@ -85,6 +96,7 @@ class GeoTrainingDatasetBuildConfig:
     )
     training_keys: tuple[str, ...] = DEFAULT_GEO_TRAINING_KEYS
     alignment_resolution_tolerance_m: float = 0.001
+    sparse_observation_time_tolerance_s: float | None = 60.0
 
 
 @dataclass(frozen=True)
@@ -290,11 +302,13 @@ class GeoTrainingDatasetBuilder:
         resolution_m: float,
     ) -> GeoTrainingSampleMetadata:
         binding = manifest.training_bindings[0] if manifest.training_bindings else None
-        pixel_assets = _assets_for_key(binding, "pixels") or tuple(
+        pixel_assets = _pixel_assets_for_sample(manifest, binding, step)
+        orthomosaic_assets = _assets_for_key(binding, "orthomosaic") or tuple(
             tile.tile_id for tile in manifest.orthomosaic_tiles
         )
         geo_assets = _assets_for_key(binding, "geo_layers") or tuple(
-            layer.layer_id for layer in manifest.raster_layers
+            [layer.layer_id for layer in manifest.raster_layers]
+            + [layer.layer_id for layer in manifest.vector_layers]
         )
         uncertainty_assets = _assets_for_key(binding, "uncertainty") or tuple(
             layer.uncertainty_id for layer in manifest.uncertainty
@@ -309,6 +323,20 @@ class GeoTrainingDatasetBuilder:
                     asset=asset,
                     asset_id=asset_id,
                     training_key="pixels",
+                    tile_extent=tile_extent,
+                    timestamp_s=step.timestamp_s,
+                    target_resolution_m=resolution_m,
+                    tolerance_m=(binding.resolution_tolerance_m if binding else self.config.alignment_resolution_tolerance_m),
+                )
+            )
+        for asset_id in orthomosaic_assets:
+            asset = _asset_by_id(manifest, asset_id)
+            alignments.append(
+                self._align_asset(
+                    manifest,
+                    asset=asset,
+                    asset_id=asset_id,
+                    training_key="orthomosaic",
                     tile_extent=tile_extent,
                     timestamp_s=step.timestamp_s,
                     target_resolution_m=resolution_m,
@@ -346,6 +374,22 @@ class GeoTrainingDatasetBuilder:
 
         alignments_tuple = tuple(alignments)
         geo_alignments = tuple(item for item in alignments_tuple if item.training_key == "geo_layers")
+        orthomosaic_alignments = tuple(item for item in alignments_tuple if item.training_key == "orthomosaic")
+        static_geo_assets = tuple(
+            item.asset_id
+            for item in geo_alignments
+            if _layer_role(item.layer_type) == "static"
+        )
+        dynamic_geo_assets = tuple(
+            item.asset_id
+            for item in geo_alignments
+            if _layer_role(item.layer_type) == "dynamic"
+        )
+        vector_assets = tuple(
+            item.asset_id
+            for item in geo_alignments
+            if _layer_role(item.layer_type) == "vector"
+        )
         source_ids = tuple(
             sorted({item.source_id for item in alignments_tuple if item.available and item.source_id})
         )
@@ -374,13 +418,22 @@ class GeoTrainingDatasetBuilder:
         proprioception = tuple(_state_float(step.state, field_name) for field_name in self.config.proprio_order)
         training_keys: dict[str, JsonValue] = {
             "pixels": list(pixel_assets),
+            "orthomosaic": [item.asset_id for item in orthomosaic_alignments],
+            "sparse_uav_frames": [
+                asset_id for asset_id in pixel_assets if isinstance(_asset_by_id(manifest, asset_id), UAVObservation)
+            ],
             "action": list(action),
             "proprio": list(proprioception),
             "proprioception": list(proprioception),
             "geo_layers": [item.asset_id for item in geo_alignments],
+            "static_geo_layers": list(static_geo_assets),
+            "dynamic_geo_layers": list(dynamic_geo_assets),
+            "vector_layers": list(vector_assets),
             "uncertainty": list(uncertainty_assets),
             "timestamps": step.timestamp_s,
             "source_ids": list(source_ids),
+            "geo_layer_types": [item.layer_type for item in geo_alignments],
+            "geo_layer_channels": _channel_schema(manifest, geo_alignments),
             "geo_layer_available": list(available_mask),
             "unavailable_layer_mask": list(unavailable_mask),
         }
@@ -437,6 +490,29 @@ class GeoTrainingDatasetBuilder:
         provenance = getattr(asset, "provenance", None)
         source_id = provenance.source_id if provenance is not None else None
         grid = getattr(asset, "grid", None)
+        if isinstance(asset, UAVObservation):
+            return self._align_sparse_observation(
+                manifest,
+                asset=asset,
+                asset_id=asset_id,
+                training_key=training_key,
+                layer_type=layer_type,
+                source_id=source_id,
+                tile_extent=tile_extent,
+                timestamp_s=timestamp_s,
+            )
+        if isinstance(asset, VectorLayer):
+            return self._align_vector_asset(
+                manifest,
+                asset=asset,
+                asset_id=asset_id,
+                training_key=training_key,
+                layer_type=layer_type,
+                source_id=source_id,
+                tile_extent=tile_extent,
+                timestamp_s=timestamp_s,
+                target_resolution_m=target_resolution_m,
+            )
         if grid is None:
             return GeoLayerAlignment(
                 asset_id=asset_id,
@@ -471,6 +547,128 @@ class GeoTrainingDatasetBuilder:
             unavailable_mask_value=0,
             reason="aligned",
             resolution_m=grid.resolution_m,
+            timestamp_s=timestamp_s,
+            tile_extent=tile_extent,
+        )
+
+    def _align_sparse_observation(
+        self,
+        manifest: GeoDatasetManifest,
+        *,
+        asset: UAVObservation,
+        asset_id: str,
+        training_key: str,
+        layer_type: str,
+        source_id: str | None,
+        tile_extent: BoundingBox,
+        timestamp_s: float,
+    ) -> GeoLayerAlignment:
+        asset_crs = asset.crs or manifest.crs
+        tile_crs = tile_extent.crs or manifest.crs
+        if not _same_crs(asset_crs, tile_crs):
+            return GeoLayerAlignment(
+                asset_id=asset_id,
+                training_key=training_key,
+                layer_type=layer_type,
+                source_id=source_id,
+                available=False,
+                unavailable_mask_value=1,
+                reason="crs_mismatch",
+                resolution_m=None,
+                timestamp_s=timestamp_s,
+                tile_extent=tile_extent,
+            )
+        tolerance_s = self.config.sparse_observation_time_tolerance_s
+        if tolerance_s is not None and abs(asset.timestamp_s - timestamp_s) > tolerance_s:
+            return GeoLayerAlignment(
+                asset_id=asset_id,
+                training_key=training_key,
+                layer_type=layer_type,
+                source_id=source_id,
+                available=False,
+                unavailable_mask_value=1,
+                reason="timestamp_outside_sparse_observation_tolerance",
+                resolution_m=None,
+                timestamp_s=timestamp_s,
+                tile_extent=tile_extent,
+            )
+        return GeoLayerAlignment(
+            asset_id=asset_id,
+            training_key=training_key,
+            layer_type=layer_type,
+            source_id=source_id,
+            available=True,
+            unavailable_mask_value=0,
+            reason="time_aligned_sparse_observation",
+            resolution_m=None,
+            timestamp_s=timestamp_s,
+            tile_extent=tile_extent,
+        )
+
+    def _align_vector_asset(
+        self,
+        manifest: GeoDatasetManifest,
+        *,
+        asset: VectorLayer,
+        asset_id: str,
+        training_key: str,
+        layer_type: str,
+        source_id: str | None,
+        tile_extent: BoundingBox,
+        timestamp_s: float,
+        target_resolution_m: float,
+    ) -> GeoLayerAlignment:
+        asset_crs = asset.crs or manifest.crs
+        tile_crs = tile_extent.crs or manifest.crs
+        if not _same_crs(asset_crs, tile_crs):
+            return GeoLayerAlignment(
+                asset_id=asset_id,
+                training_key=training_key,
+                layer_type=layer_type,
+                source_id=source_id,
+                available=False,
+                unavailable_mask_value=1,
+                reason="crs_mismatch",
+                resolution_m=target_resolution_m,
+                timestamp_s=timestamp_s,
+                tile_extent=tile_extent,
+            )
+        if not (asset.temporal_window.start_s <= timestamp_s <= asset.temporal_window.end_s):
+            return GeoLayerAlignment(
+                asset_id=asset_id,
+                training_key=training_key,
+                layer_type=layer_type,
+                source_id=source_id,
+                available=False,
+                unavailable_mask_value=1,
+                reason="timestamp_outside_layer_window",
+                resolution_m=target_resolution_m,
+                timestamp_s=timestamp_s,
+                tile_extent=tile_extent,
+            )
+        extent = _asset_vector_extent(asset)
+        if extent is not None and not _intersects(tile_extent, extent):
+            return GeoLayerAlignment(
+                asset_id=asset_id,
+                training_key=training_key,
+                layer_type=layer_type,
+                source_id=source_id,
+                available=False,
+                unavailable_mask_value=1,
+                reason="tile_outside_layer_extent",
+                resolution_m=target_resolution_m,
+                timestamp_s=timestamp_s,
+                tile_extent=tile_extent,
+            )
+        return GeoLayerAlignment(
+            asset_id=asset_id,
+            training_key=training_key,
+            layer_type=layer_type,
+            source_id=source_id,
+            available=True,
+            unavailable_mask_value=0,
+            reason="aligned",
+            resolution_m=target_resolution_m,
             timestamp_s=timestamp_s,
             tile_extent=tile_extent,
         )
@@ -843,10 +1041,30 @@ def _assets_for_key(binding: LeWMTrainingBinding | None, key: str) -> tuple[str,
     return tuple(binding.keys_to_assets.get(key, ()))
 
 
+def _pixel_assets_for_sample(
+    manifest: GeoDatasetManifest,
+    binding: LeWMTrainingBinding | None,
+    step: TrajectoryStep,
+) -> tuple[str, ...]:
+    configured = _assets_for_key(binding, "pixels")
+    if step.observation_id and (
+        not configured or step.observation_id in configured
+    ):
+        return (step.observation_id,)
+    if configured:
+        return configured
+    if manifest.uav_observations:
+        return (manifest.uav_observations[0].observation_id,)
+    return tuple(tile.tile_id for tile in manifest.orthomosaic_tiles)
+
+
 def _asset_by_id(manifest: GeoDatasetManifest, asset_id: str) -> Any | None:
     for collection in (
         manifest.orthomosaic_tiles,
         manifest.raster_layers,
+        manifest.vector_layers,
+        manifest.uav_observations,
+        manifest.trajectory,
         manifest.masks,
         manifest.uncertainty,
     ):
@@ -854,6 +1072,8 @@ def _asset_by_id(manifest: GeoDatasetManifest, asset_id: str) -> Any | None:
             if asset_id in (
                 getattr(asset, "tile_id", None),
                 getattr(asset, "layer_id", None),
+                getattr(asset, "observation_id", None),
+                getattr(asset, "step_id", None),
                 getattr(asset, "mask_id", None),
                 getattr(asset, "uncertainty_id", None),
             ):
@@ -862,12 +1082,50 @@ def _asset_by_id(manifest: GeoDatasetManifest, asset_id: str) -> Any | None:
 
 
 def _asset_layer_type(asset: Any) -> str:
+    if isinstance(asset, UAVObservation):
+        return "sparse_uav"
     return str(
         getattr(asset, "layer_type", None)
         or getattr(asset, "mask_type", None)
         or getattr(asset, "uncertainty_type", None)
         or "orthomosaic"
     )
+
+
+def _layer_role(layer_type: str) -> str:
+    normalized = layer_type.lower()
+    if normalized in VECTOR_GEO_LAYER_TYPES:
+        return "vector"
+    if normalized in DYNAMIC_GEO_LAYER_TYPES:
+        return "dynamic"
+    if normalized in STATIC_GEO_LAYER_TYPES:
+        return "static"
+    return "context"
+
+
+def _channel_schema(
+    manifest: GeoDatasetManifest,
+    alignments: Sequence[GeoLayerAlignment],
+) -> list[JsonValue]:
+    channels: list[JsonValue] = []
+    for alignment in alignments:
+        asset = _asset_by_id(manifest, alignment.asset_id)
+        bands = tuple(str(band) for band in getattr(asset, "bands", ()))
+        if not bands:
+            bands = (alignment.layer_type,)
+        for band_index, band_name in enumerate(bands):
+            channels.append(
+                {
+                    "asset_id": alignment.asset_id,
+                    "layer_type": alignment.layer_type,
+                    "role": _layer_role(alignment.layer_type),
+                    "band_index": band_index,
+                    "band_name": band_name,
+                    "available": alignment.available,
+                    "source_id": alignment.source_id,
+                }
+            )
+    return channels
 
 
 def _same_crs(left: CRSDefinition | None, right: CRSDefinition | None) -> bool:
@@ -889,6 +1147,27 @@ def _grid_extent(grid: GeoGrid, crs: CRSDefinition | None) -> BoundingBox:
         max_y=grid.origin_y + grid.height_px * grid.resolution_m,
         crs=grid.crs or crs,
     )
+
+
+def _asset_vector_extent(asset: VectorLayer) -> BoundingBox | None:
+    metadata = dict(asset.metadata)
+    raw_bounds = metadata.get("bounds")
+    if isinstance(raw_bounds, BoundingBox):
+        return raw_bounds
+    if isinstance(raw_bounds, Mapping):
+        try:
+            return _bbox(raw_bounds)
+        except (KeyError, TypeError, ValueError):
+            return None
+    ingestion = metadata.get("ingestion")
+    if isinstance(ingestion, Mapping):
+        raw_ingestion_bounds = ingestion.get("bounds")
+        if isinstance(raw_ingestion_bounds, Mapping):
+            try:
+                return _bbox(raw_ingestion_bounds)
+            except (KeyError, TypeError, ValueError):
+                return None
+    return None
 
 
 def _intersects(left: BoundingBox, right: BoundingBox) -> bool:
@@ -1215,29 +1494,58 @@ def _materialize_sample(
 ) -> dict[str, Any]:
     tile = config.tile
     pixel_channels = _pixel_channels(manifest, sample)
-    geo_channels = len([item for item in sample.alignments if item.training_key == "geo_layers"])
-    uncertainty_channels = len([item for item in sample.alignments if item.training_key == "uncertainty"])
+    orthomosaic_alignments = tuple(
+        item for item in sample.alignments if item.training_key == "orthomosaic"
+    )
+    geo_alignments = tuple(
+        item for item in sample.alignments if item.training_key == "geo_layers"
+    )
+    uncertainty_alignments = tuple(
+        item for item in sample.alignments if item.training_key == "uncertainty"
+    )
     return {
-        "pixels": np.full(
-            (tile.height_px, tile.width_px, pixel_channels),
-            _constant_for_key(manifest, "pixels", 0),
-            dtype=np.uint8,
+        "pixels": _materialize_pixels(
+            manifest,
+            sample,
+            tile,
+            np,
+            pixel_channels=pixel_channels,
         ),
         "action": np.asarray(sample.training_keys["action"], dtype=np.float32),
         "proprio": np.asarray(sample.training_keys["proprio"], dtype=np.float32),
         "proprioception": np.asarray(sample.training_keys["proprioception"], dtype=np.float32),
-        "geo_layers": np.full(
-            (tile.height_px, tile.width_px, geo_channels),
-            _constant_for_key(manifest, "geo_layers", 0.0),
+        "orthomosaic": _materialize_layer_stack(
+            manifest,
+            sample,
+            orthomosaic_alignments,
+            tile,
+            np,
+            default_value=_constant_for_key(manifest, "orthomosaic", 0.0),
             dtype=np.float32,
         ),
-        "uncertainty": np.full(
-            (tile.height_px, tile.width_px, uncertainty_channels),
-            _constant_for_key(manifest, "uncertainty", 0.0),
+        "geo_layers": _materialize_layer_stack(
+            manifest,
+            sample,
+            geo_alignments,
+            tile,
+            np,
+            default_value=_constant_for_key(manifest, "geo_layers", 0.0),
+            dtype=np.float32,
+        ),
+        "uncertainty": _materialize_layer_stack(
+            manifest,
+            sample,
+            uncertainty_alignments,
+            tile,
+            np,
+            default_value=_constant_for_key(manifest, "uncertainty", 0.0),
             dtype=np.float32,
         ),
         "timestamps": np.asarray(sample.timestamp_s, dtype=np.float64),
         "source_ids": "|".join(sample.source_ids),
+        "sample_id": sample.sample_id,
+        "tile_id": sample.tile_id,
+        "geo_layer_channels": json.dumps(sample.training_keys["geo_layer_channels"], sort_keys=True),
         "geo_layer_available": np.asarray(sample.training_keys["geo_layer_available"], dtype=np.uint8),
         "unavailable_layer_mask": np.asarray(sample.training_keys["unavailable_layer_mask"], dtype=np.uint8),
         "ep_idx": np.asarray(episode_index, dtype=np.int32),
@@ -1249,10 +1557,255 @@ def _pixel_channels(manifest: GeoDatasetManifest, sample: GeoTrainingSampleMetad
     pixel_asset_ids = tuple(str(item) for item in sample.training_keys.get("pixels", []))
     for asset_id in pixel_asset_ids:
         asset = _asset_by_id(manifest, asset_id)
+        if isinstance(asset, UAVObservation):
+            return int(asset.camera.get("channels") or asset.camera.get("band_count") or 3)
         bands = getattr(asset, "bands", ())
         if bands:
             return len(bands)
     return 3
+
+
+def _materialize_pixels(
+    manifest: GeoDatasetManifest,
+    sample: GeoTrainingSampleMetadata,
+    tile: GeoTrainingTileSpec,
+    np: Any,
+    *,
+    pixel_channels: int,
+) -> Any:
+    for asset_id in tuple(str(item) for item in sample.training_keys.get("pixels", [])):
+        asset = _asset_by_id(manifest, asset_id)
+        if isinstance(asset, UAVObservation):
+            image = _read_image_frame(
+                asset.frame_uri,
+                tile.height_px,
+                tile.width_px,
+                pixel_channels,
+                np,
+            )
+            if image is not None:
+                return image
+        elif asset is not None:
+            raster = _read_raster_like_tile(
+                asset,
+                sample.tile_extent,
+                tile.height_px,
+                tile.width_px,
+                np,
+                dtype=np.uint8,
+            )
+            if raster is not None and raster.shape[-1] > 0:
+                return _ensure_channels(raster, pixel_channels, np, dtype=np.uint8)
+    return np.full(
+        (tile.height_px, tile.width_px, pixel_channels),
+        _constant_for_key(manifest, "pixels", 0),
+        dtype=np.uint8,
+    )
+
+
+def _materialize_layer_stack(
+    manifest: GeoDatasetManifest,
+    sample: GeoTrainingSampleMetadata,
+    alignments: Sequence[GeoLayerAlignment],
+    tile: GeoTrainingTileSpec,
+    np: Any,
+    *,
+    default_value: float | int,
+    dtype: Any,
+) -> Any:
+    arrays = []
+    for alignment in alignments:
+        asset = _asset_by_id(manifest, alignment.asset_id)
+        channels = _asset_channel_count(asset)
+        if alignment.available and isinstance(asset, VectorLayer):
+            array = _read_vector_tile(
+                asset,
+                sample.tile_extent,
+                tile.height_px,
+                tile.width_px,
+                np,
+            )
+        elif alignment.available and asset is not None:
+            array = _read_raster_like_tile(
+                asset,
+                sample.tile_extent,
+                tile.height_px,
+                tile.width_px,
+                np,
+                dtype=dtype,
+            )
+        else:
+            array = None
+        if array is None:
+            array = np.full(
+                (tile.height_px, tile.width_px, channels),
+                default_value,
+                dtype=dtype,
+            )
+        arrays.append(_ensure_channels(array, channels, np, dtype=dtype))
+    if not arrays:
+        return np.zeros((tile.height_px, tile.width_px, 0), dtype=dtype)
+    return np.concatenate(arrays, axis=-1).astype(dtype, copy=False)
+
+
+def _asset_channel_count(asset: Any | None) -> int:
+    if asset is None:
+        return 1
+    bands = getattr(asset, "bands", ())
+    if bands:
+        return max(1, len(tuple(bands)))
+    return 1
+
+
+def _read_image_frame(
+    uri: str,
+    height_px: int,
+    width_px: int,
+    channels: int,
+    np: Any,
+) -> Any | None:
+    path = _local_uri_path(uri)
+    if path is None or not path.exists():
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        with Image.open(path) as image:
+            mode = "L" if channels == 1 else "RGB"
+            resized = image.convert(mode).resize((width_px, height_px))
+            array = np.asarray(resized)
+    except OSError:
+        return None
+    if channels == 1:
+        array = array.reshape(height_px, width_px, 1)
+    return _ensure_channels(array, channels, np, dtype=np.uint8)
+
+
+def _read_raster_like_tile(
+    asset: Any,
+    tile_extent: BoundingBox,
+    height_px: int,
+    width_px: int,
+    np: Any,
+    *,
+    dtype: Any,
+) -> Any | None:
+    uri = getattr(asset, "uri", None)
+    if not isinstance(uri, str):
+        return None
+    path = _local_uri_path(uri)
+    if path is None or not path.exists():
+        return None
+    try:
+        import rasterio
+        from rasterio.windows import from_bounds
+    except ImportError:
+        return None
+    try:
+        with rasterio.open(path) as dataset:
+            indexes = tuple(range(1, dataset.count + 1))
+            if not indexes:
+                return None
+            window = from_bounds(
+                tile_extent.min_x,
+                tile_extent.min_y,
+                tile_extent.max_x,
+                tile_extent.max_y,
+                dataset.transform,
+            )
+            nodata = dataset.nodata if dataset.nodata is not None else 0
+            data = dataset.read(
+                indexes=indexes,
+                window=window,
+                out_shape=(len(indexes), height_px, width_px),
+                boundless=True,
+                fill_value=nodata,
+            )
+    except Exception:
+        return None
+    return np.moveaxis(data, 0, -1).astype(dtype, copy=False)
+
+
+def _read_vector_tile(
+    asset: VectorLayer,
+    tile_extent: BoundingBox,
+    height_px: int,
+    width_px: int,
+    np: Any,
+) -> Any | None:
+    path = _local_uri_path(asset.uri)
+    if path is None or not path.exists():
+        return None
+    try:
+        import pyogrio
+        from rasterio.features import rasterize
+        from rasterio.transform import from_bounds
+    except ImportError:
+        return None
+    try:
+        frame = pyogrio.read_dataframe(
+            path,
+            bbox=(
+                tile_extent.min_x,
+                tile_extent.min_y,
+                tile_extent.max_x,
+                tile_extent.max_y,
+            ),
+        )
+        geometries = [
+            geometry
+            for geometry in getattr(frame, "geometry", ())
+            if geometry is not None and not getattr(geometry, "is_empty", False)
+        ]
+    except Exception:
+        return None
+    transform = from_bounds(
+        tile_extent.min_x,
+        tile_extent.min_y,
+        tile_extent.max_x,
+        tile_extent.max_y,
+        width_px,
+        height_px,
+    )
+    burned = rasterize(
+        ((geometry, 1.0) for geometry in geometries),
+        out_shape=(height_px, width_px),
+        transform=transform,
+        fill=0.0,
+        dtype="float32",
+    )
+    return burned.reshape(height_px, width_px, 1)
+
+
+def _ensure_channels(
+    array: Any,
+    channels: int,
+    np: Any,
+    *,
+    dtype: Any,
+) -> Any:
+    if len(array.shape) == 2:
+        array = array.reshape(array.shape[0], array.shape[1], 1)
+    current_channels = int(array.shape[-1])
+    if current_channels == channels:
+        return array.astype(dtype, copy=False)
+    if current_channels > channels:
+        return array[..., :channels].astype(dtype, copy=False)
+    padding = np.zeros(
+        (*array.shape[:-1], channels - current_channels),
+        dtype=array.dtype,
+    )
+    return np.concatenate((array, padding), axis=-1).astype(dtype, copy=False)
+
+
+def _local_uri_path(uri: str) -> Path | None:
+    if uri.startswith("memory://") or "://" in uri and not uri.startswith("file://"):
+        return None
+    if uri.startswith("file://"):
+        return Path(uri[7:])
+    return Path(uri)
 
 
 def _constant_for_key(manifest: GeoDatasetManifest, key: str, default: float | int) -> float | int:

@@ -1,0 +1,105 @@
+foundation:
+  name: canadian_layered_geo_ai_world_model
+  version: 0.1.0
+  schema: canadian-layered-geo-ai-world-model/v1
+  required_modalities:
+    - elevation
+    - ice
+    - weather
+    - land_cover
+    - hydro
+    - sparse_uav_imagery
+    - orthomosaic
+  binding_id: canadian-layered-geo-ai-world-model-v1
+  model_input_resolution_m: null
+  resolution_tolerance_m: 0.001
+
+layers:
+  static:
+    elevation:
+      provider_id: nrcan_elevation
+      accepted_layer_types: [dem, elevation, dtm, dsm]
+      default_bands: [elevation_m]
+    land_cover:
+      provider_id: canadian_land_cover
+      accepted_layer_types: [land_cover, landcover, lulc]
+      default_bands: [land_cover_class]
+    hydro:
+      provider_id: canadian_hydro
+      accepted_layer_types: [hydro, hydrology, hydrography, water]
+      vector_rasterization: binary_geometry
+  dynamic:
+    weather:
+      provider_id: eccc_msc_geomet
+      accepted_layer_types: [weather, meteorology, meteo]
+      default_bands: [wind_u_mps, wind_v_mps, temperature_c]
+      default_max_age_s: 21600
+    ice:
+      provider_id: canadian_ice_service
+      accepted_layer_types: [ice, sea_ice, lake_ice]
+      default_bands: [ice_probability]
+      default_max_age_s: 86400
+  imagery:
+    sparse_uav_imagery:
+      provider_id: uav_orthomosaic
+      training_key: pixels
+      time_tolerance_s: 60
+    orthomosaic:
+      provider_id: uav_orthomosaic
+      training_key: orthomosaic
+
+training:
+  output_format: hdf5
+  tile:
+    width_px: 256
+    height_px: 256
+    resolution_m: null
+    stride_x_px: 256
+    stride_y_px: 256
+    include_partial_tiles: false
+  split_fractions:
+    train: 0.7
+    val: 0.15
+    test: 0.15
+  split_dimensions: [aoi, season, time, sensor, mission]
+  leakage_guard_dimensions: [aoi, mission]
+  keys:
+    - pixels
+    - orthomosaic
+    - sparse_uav_frames
+    - action
+    - proprio
+    - proprioception
+    - geo_layers
+    - static_geo_layers
+    - dynamic_geo_layers
+    - vector_layers
+    - uncertainty
+    - timestamps
+    - source_ids
+    - geo_layer_types
+    - geo_layer_channels
+    - geo_layer_available
+    - unavailable_layer_mask
+
+source_catalog:
+  elevation:
+    name: NRCan High Resolution Digital Elevation Model / CanElevation
+    provider_id: nrcan_elevation
+    url: https://open.canada.ca/data/en/dataset/957782bf-847c-4644-a757-e383c0057995
+  weather:
+    name: ECCC MSC GeoMet OGC API
+    provider_id: eccc_msc_geomet
+    url: https://api.weather.gc.ca/
+  ice:
+    name: Canadian Ice Service archive and latest conditions
+    provider_id: canadian_ice_service
+    url: https://www.canada.ca/en/environment-climate-change/services/ice-forecasts-observations/latest-conditions/archive-overview.html
+  land_cover:
+    name: AAFC/NRCan land-cover products
+    provider_id: canadian_land_cover
+    url: https://open.canada.ca/data/en/dataset/dedb79e3-1397-4aff-9756-9e78904b11b0
+  hydro:
+    name: Canadian Hydrospatial Network / National Hydro Network
+    provider_id: canadian_hydro
+    url: https://natural-resources.canada.ca/science-data/data-analysis/geospatial-data-tools-services/canadian-hydrospatial-network

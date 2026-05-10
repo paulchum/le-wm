@@ -352,8 +352,10 @@ def validate_geospatial_dataset_manifest(
     _validate_bounds(manifest.aoi.bounds, manifest.crs, findings)
 
     asset_resolutions: dict[str, float] = {}
+    known_asset_ids: set[str] = set()
     for index, layer in enumerate(manifest.raster_layers):
         path = f"raster_layers[{index}]"
+        known_asset_ids.add(layer.layer_id)
         asset_resolutions[layer.layer_id] = layer.grid.resolution_m
         _validate_temporal_window(layer.temporal_window, f"{path}.temporal_window", findings)
         _validate_grid(layer.grid, manifest.crs, f"{path}.grid", findings)
@@ -369,6 +371,7 @@ def validate_geospatial_dataset_manifest(
 
     for index, layer in enumerate(manifest.vector_layers):
         path = f"vector_layers[{index}]"
+        known_asset_ids.add(layer.layer_id)
         _validate_temporal_window(layer.temporal_window, f"{path}.temporal_window", findings)
         _validate_crs(_effective_crs(layer.crs, manifest.crs), f"{path}.crs", findings)
         _validate_provenance(layer.provenance, f"{path}.provenance", findings)
@@ -383,6 +386,7 @@ def validate_geospatial_dataset_manifest(
 
     for index, tile in enumerate(manifest.orthomosaic_tiles):
         path = f"orthomosaic_tiles[{index}]"
+        known_asset_ids.add(tile.tile_id)
         asset_resolutions[tile.tile_id] = tile.grid.resolution_m
         _validate_temporal_window(tile.temporal_window, f"{path}.temporal_window", findings)
         _validate_grid(tile.grid, manifest.crs, f"{path}.grid", findings)
@@ -398,6 +402,7 @@ def validate_geospatial_dataset_manifest(
 
     for index, observation in enumerate(manifest.uav_observations):
         path = f"uav_observations[{index}]"
+        known_asset_ids.add(observation.observation_id)
         _validate_crs(_effective_crs(observation.crs, manifest.crs), f"{path}.crs", findings)
         _validate_provenance(observation.provenance, f"{path}.provenance", findings)
         _validate_data_age(
@@ -411,6 +416,7 @@ def validate_geospatial_dataset_manifest(
 
     for index, step in enumerate(manifest.trajectory):
         path = f"trajectory[{index}]"
+        known_asset_ids.add(step.step_id)
         _validate_provenance(step.provenance, f"{path}.provenance", findings)
         if step.data_age is not None:
             _validate_data_age(
@@ -424,6 +430,7 @@ def validate_geospatial_dataset_manifest(
 
     for index, label in enumerate(manifest.labels):
         path = f"labels[{index}]"
+        known_asset_ids.add(label.target_id)
         if label.temporal_window is not None:
             _validate_temporal_window(label.temporal_window, f"{path}.temporal_window", findings)
         if label.crs is not None:
@@ -440,6 +447,7 @@ def validate_geospatial_dataset_manifest(
 
     for index, mask in enumerate(manifest.masks):
         path = f"masks[{index}]"
+        known_asset_ids.add(mask.mask_id)
         asset_resolutions[mask.mask_id] = mask.grid.resolution_m
         _validate_grid(mask.grid, manifest.crs, f"{path}.grid", findings)
         _validate_provenance(mask.provenance, f"{path}.provenance", findings)
@@ -454,6 +462,7 @@ def validate_geospatial_dataset_manifest(
 
     for index, uncertainty in enumerate(manifest.uncertainty):
         path = f"uncertainty[{index}]"
+        known_asset_ids.add(uncertainty.uncertainty_id)
         asset_resolutions[uncertainty.uncertainty_id] = uncertainty.grid.resolution_m
         _validate_grid(uncertainty.grid, manifest.crs, f"{path}.grid", findings)
         _validate_provenance(uncertainty.provenance, f"{path}.provenance", findings)
@@ -470,6 +479,7 @@ def validate_geospatial_dataset_manifest(
         _validate_training_binding(
             binding,
             asset_resolutions,
+            known_asset_ids,
             f"training_bindings[{index}]",
             findings,
         )
@@ -606,6 +616,7 @@ def _validate_data_age(
 def _validate_training_binding(
     binding: LeWMTrainingBinding,
     asset_resolutions: Mapping[str, float],
+    known_asset_ids: set[str],
     path: str,
     findings: list[GeoDatasetValidationFinding],
 ) -> None:
@@ -617,13 +628,23 @@ def _validate_training_binding(
             _error("missing_training_key", f"{path}.keys_to_assets", f"missing {key}")
         )
 
+    for key, asset_ids in binding.keys_to_assets.items():
+        for asset_id in asset_ids:
+            if asset_id not in known_asset_ids:
+                findings.append(
+                    _error(
+                        "unknown_training_asset",
+                        path,
+                        f"{key} references unknown asset {asset_id}",
+                    )
+                )
+
     pixel_assets = binding.keys_to_assets.get("pixels", ())
     for asset_id in pixel_assets:
+        if asset_id not in known_asset_ids:
+            continue
         resolution = asset_resolutions.get(asset_id)
         if resolution is None:
-            findings.append(
-                _error("unknown_training_asset", path, f"pixels references unknown asset {asset_id}")
-            )
             continue
         if binding.model_input_resolution_m is None:
             continue

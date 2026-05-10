@@ -1,0 +1,151 @@
+offering:
+  market: canadian_government_defence
+  posture: dual_track_with_guarded_kinetic_support_contexts
+  first_product: autonomy_kit
+  strategic_product: canadian_reference_uas
+
+architecture:
+  airframe_layer:
+    initial_path: partner_canadian_or_nato_compatible_airframes
+    reference_platform_trigger: autonomy_kit_validated_in_partner_trials
+  flight_control_layer:
+    supported_controllers:
+      - px4
+      - ardupilot
+    responsibilities:
+      - stabilization
+      - failsafes
+      - geofence
+      - return_to_launch
+      - manual_override
+  sensor_layer:
+    required:
+      - rgb_camera
+      - imu
+      - gnss
+      - barometer
+    optional:
+      - thermal_camera
+      - range_or_depth_sensor
+      - mission_payload_metadata
+  autonomy_layer:
+    kit_interface: drone_ai.AutonomyKit
+    planner_interface: drone_ai.WorldModelPlanner
+    learned_model_role:
+      - score_short_horizon_action_candidates
+      - predict_latent_rollouts
+      - report_surprise_anomaly_scores
+    effect_boundary:
+      - mobility_autonomy_only
+      - kinetic_context_allowed_only_when_explicitly_configured
+      - effect_commands_blocked_by_package
+  safety_layer:
+    supervisor: drone_ai.SafetySupervisor
+    hard_filters:
+      - altitude
+      - speed
+      - battery
+      - comms_link
+      - obstacle_or_geofence
+      - operator_authority
+      - non_kinetic_constraint
+  operator_layer:
+    required_features:
+      - mission_planning
+      - live_status
+      - recommended_action
+      - confidence_and_surprise
+      - operator_override
+      - audit_log_review
+  data_mlops_layer:
+    residency: canada_by_default
+    artifacts:
+      - immutable_flight_logs
+      - training_datasets
+      - evaluation_reports
+      - model_cards
+      - deployment_approvals
+
+safety_envelope:
+  min_altitude_m: 1.0
+  max_altitude_m: 120.0
+  max_horizontal_speed_mps: 8.0
+  max_vertical_speed_mps: 3.0
+  max_yaw_rate_rps: 1.5
+  max_duration_s: 2.0
+  min_battery_percent: 25.0
+  require_comms_link: true
+  require_operator_authority: true
+  require_non_kinetic: true
+  allow_kinetic_context: false
+  allow_clipping: true
+  constraints_version: canadian-defence-rd-v1
+
+autonomy_kit:
+  default_mode: advisory
+  supported_modes:
+    - advisory
+    - dry_run
+    - closed_loop
+  default_effect_context: non_kinetic
+  supported_effect_contexts:
+    - non_kinetic
+    - kinetic_support
+  kinetic_support_boundary:
+    allowed:
+      - route_repositioning_in_kinetic_operating_area
+      - overwatch_positioning_for_human_command
+      - sensor_viewpoint_recommendation
+      - post_effect_battle_damage_assessment_routing
+      - casualty_or_damage_avoidance_navigation
+    blocked:
+      - autonomous_target_selection
+      - weapon_release
+      - payload_release
+      - target_engagement
+      - lethal_effect_decision
+  candidate_sampler:
+    forward_speeds_mps: [0.0, 1.5, 3.0]
+    lateral_speeds_mps: [-1.0, 0.0, 1.0]
+    vertical_speeds_mps: [-0.5, 0.0, 0.5]
+    yaw_rates_rps: [-0.25, 0.0, 0.25]
+    durations_s: [1.0]
+    max_candidates: 128
+
+market_path:
+  validation_channels:
+    - nrc_drone_innovation_hub
+    - drdc_test_environments
+    - dnd_end_user_trials
+  funding_channels:
+    - ideas
+    - innovative_solutions_canada
+    - strategic_response_fund
+  procurement_positioning:
+    - itb_ready_canadian_autonomy_module
+    - canadian_controlled_ip
+    - secure_canadian_data_residency
+
+rollout_gates:
+  - simulation_only
+  - passive_onboard_logging
+  - advisory_only_recommendations
+  - safety_filtered_closed_loop_flight
+  - partner_airframe_field_trial
+  - reference_platform_prototype
+
+acceptance_metrics:
+  - goal_reaching_rate
+  - safety_filter_rejection_rate
+  - prediction_error
+  - anomaly_precision_recall
+  - p95_edge_latency_ms
+  - operator_override_behavior
+  - repeatability_across_environments
+
+compliance_defaults:
+  - controlled_goods_review_before_sensitive_payloads_or_technical_data
+  - export_control_review_before_external_transfer
+  - secure_development_environment
+  - audit_logs_for_model_and_mission_decisions
+  - no_autonomous_targeting_or_lethal_decision_making

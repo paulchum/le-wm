@@ -32,6 +32,23 @@ RASTER_EXTENSIONS = frozenset(
 )
 VECTOR_EXTENSIONS = frozenset({".geojson", ".json", ".gpkg", ".shp", ".fgb"})
 
+__all__ = [
+    "CanadianGeoIngestionPipeline",
+    "CanadianHydroProvider",
+    "CanadianIceServiceProvider",
+    "CanadianLandCoverProvider",
+    "ECCCMSCGeoMetProvider",
+    "GeoDatasetManifest",
+    "GeoIngestionError",
+    "GeoIngestionRequest",
+    "GeoLayerManifest",
+    "GeoProvider",
+    "NRCanElevationProvider",
+    "RemoteSourceRef",
+    "UAVOrthomosaicProvider",
+    "default_canadian_geo_providers",
+]
+
 
 @dataclass(frozen=True)
 class RemoteSourceRef:

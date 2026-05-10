@@ -1,0 +1,120 @@
+diff --git a/aircraft/aircraft_ws/src/offboard_control/src/px4_offboard.hpp b/aircraft/aircraft_ws/src/offboard_control/src/px4_offboard.hpp
+index 7e3a99a..9f1a7f1 100644
+--- a/aircraft/aircraft_ws/src/offboard_control/src/px4_offboard.hpp
++++ b/aircraft/aircraft_ws/src/offboard_control/src/px4_offboard.hpp
+@@ -80,6 +80,7 @@ private:
+     rclcpp::Subscription<ground_system_msgs::msg::SwarmObs>::SharedPtr ground_tracks_sub_;
+     rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr yolo_detections_sub_;
+     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr kiss_odometry_sub_;
++    rclcpp::Subscription<TrajectorySetpoint>::SharedPtr lewm_trajectory_setpoint_sub_;
+ 
+     // Subscribers variables
+     double lat_, lon_, alt_, alt_ellipsoid_;
+@@ -101,6 +102,9 @@ private:
+ 
+     // Guidance variables
+     double traj_ref_east, traj_ref_north, traj_ref_up;
++    TrajectorySetpoint::SharedPtr lewm_trajectory_setpoint_;
++    rclcpp::Time lewm_trajectory_setpoint_time_;
++    double lewm_setpoint_timeout_sec_;
+ 
+     // PX4 publishers
+     rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_mode_pub_;
+@@ -123,6 +127,7 @@ private:
+     void ground_tracks_callback(const ground_system_msgs::msg::SwarmObs::SharedPtr msg);
+     void yolo_detections_callback(const vision_msgs::msg::Detection2DArray::SharedPtr msg);
+     void kiss_odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
++    void lewm_trajectory_setpoint_callback(const TrajectorySetpoint::SharedPtr msg);
+ };
+ 
+ #endif // OFFBOARD_CONTROL__PX4_OFFBOARD_HPP_
+diff --git a/aircraft/aircraft_ws/src/offboard_control/src/px4_offboard.cpp b/aircraft/aircraft_ws/src/offboard_control/src/px4_offboard.cpp
+index 36ae70f..77e2d9e 100644
+--- a/aircraft/aircraft_ws/src/offboard_control/src/px4_offboard.cpp
++++ b/aircraft/aircraft_ws/src/offboard_control/src/px4_offboard.cpp
+@@ -9,7 +9,8 @@ PX4Offboard::PX4Offboard() : Node("px4_offboard"),
+     pose_frame_(-1), velocity_frame_(-1), true_airspeed_m_s_(NAN),
+     ground_tracks_(nullptr), yolo_detections_(nullptr),
+-    traj_ref_east(NAN), traj_ref_north(NAN), traj_ref_up(NAN)
++    traj_ref_east(NAN), traj_ref_north(NAN), traj_ref_up(NAN),
++    lewm_trajectory_setpoint_(nullptr), lewm_setpoint_timeout_sec_(0.5)
+ {
+     RCLCPP_INFO(this->get_logger(), "PX4 offboard referencing!");
+     RCLCPP_INFO(this->get_logger(), "namespace: %s", this->get_namespace());
+     // Check and log whether simulation time is enabled or not
+@@ -19,6 +20,8 @@ PX4Offboard::PX4Offboard() : Node("px4_offboard"),
+     } else {
+         RCLCPP_WARN(this->get_logger(), "Simulation time is disabled.");
+     }
++    this->declare_parameter<double>("lewm_setpoint_timeout_sec", 0.5);
++    lewm_setpoint_timeout_sec_ = this->get_parameter("lewm_setpoint_timeout_sec").as_double();
+     last_offboard_rate_check_time_ = this->get_clock()->now(); // Monitor the rate of offboard control loop
+     // Initialize the arrays
+     position_.fill(NAN);
+@@ -87,6 +90,9 @@ PX4Offboard::PX4Offboard() : Node("px4_offboard"),
+     kiss_odometry_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+         "/kiss/odometry", qos_profile_sub, // 10Hz
+         std::bind(&PX4Offboard::kiss_odometry_callback, this, std::placeholders::_1), subscriber_options);
++    lewm_trajectory_setpoint_sub_ = this->create_subscription<TrajectorySetpoint>(
++        "/lewm_drone/px4_trajectory_setpoint", qos_profile_sub, // dynamic safety-approved VTOL trajectory setpoint
++        std::bind(&PX4Offboard::lewm_trajectory_setpoint_callback, this, std::placeholders::_1), subscriber_options);
+ }
+ 
+ // Callbacks for subscribers (reentrant group)
+@@ -204,6 +210,12 @@ void PX4Offboard::kiss_odometry_callback(const nav_msgs::msg::Odometry::SharedPt
+     kiss_q_[2] = msg->pose.pose.orientation.y;
+     kiss_q_[3] = msg->pose.pose.orientation.z;
+ }
++void PX4Offboard::lewm_trajectory_setpoint_callback(const TrajectorySetpoint::SharedPtr msg)
++{
++    std::unique_lock<std::shared_mutex> lock(node_data_mutex_);
++    lewm_trajectory_setpoint_ = msg;
++    lewm_trajectory_setpoint_time_ = this->get_clock()->now();
++}
+ 
+ // Callbacks for timers (reentrant group)
+ void PX4Offboard::px4_interface_printout_callback()
+@@ -336,9 +348,41 @@ void PX4Offboard::offboard_loop_callback()
+         trajectory_ref_pub_->publish(trajectory_ref);
+     } else if (offboard_flag_ == 6) { // VTOL trajectory (velocity) reference
+         TrajectorySetpoint trajectory_ref; // https://github.com/PX4/px4_msgs/blob/release/1.16/msg/TrajectorySetpoint.msg
++        if (lewm_trajectory_setpoint_ == nullptr) {
++            RCLCPP_WARN_THROTTLE(
++                get_logger(), *get_clock(), 2000,
++                "Waiting for /lewm_drone/px4_trajectory_setpoint before publishing VTOL trajectory references");
++            return;
++        }
++        const double setpoint_age_sec = (this->get_clock()->now() - lewm_trajectory_setpoint_time_).seconds();
++        if (setpoint_age_sec > lewm_setpoint_timeout_sec_) {
++            RCLCPP_WARN_THROTTLE(
++                get_logger(), *get_clock(), 2000,
++                "Stale /lewm_drone/px4_trajectory_setpoint; suppressing VTOL trajectory reference");
++            return;
++        }
++        trajectory_ref = *lewm_trajectory_setpoint_;
+         trajectory_ref.timestamp = current_time_us;
+-        offboard_mode.velocity = true;
+-        trajectory_ref.velocity = {20.0, 0.0, 0.0};
++
++        bool has_position = false;
++        bool has_velocity = false;
++        bool has_acceleration = false;
++        for (const auto value : trajectory_ref.position) {
++            has_position = has_position || std::isfinite(value);
++        }
++        for (const auto value : trajectory_ref.velocity) {
++            has_velocity = has_velocity || std::isfinite(value);
++        }
++        for (const auto value : trajectory_ref.acceleration) {
++            has_acceleration = has_acceleration || std::isfinite(value);
++        }
++        if (!has_position && !has_velocity && !has_acceleration) {
++            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Dynamic VTOL trajectory setpoint has no finite control fields");
++            return;
++        }
++        offboard_mode.position = has_position;
++        offboard_mode.velocity = has_velocity;
++        offboard_mode.acceleration = has_acceleration;
+         trajectory_ref_pub_->publish(trajectory_ref);
+     } else {
+         RCLCPP_WARN(get_logger(), "Unexpected offboard_flag value: %d", offboard_flag_.load());

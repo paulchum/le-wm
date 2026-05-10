@@ -1,10 +1,93 @@
+# Drone AI Autonomy Kit
 
-# LeWorldModel
-### Stable End-to-End Joint-Embedding Predictive Architecture from Pixels
+This repository is a drone AI autonomy-kit codebase that uses
+**LeWorldModel (LeWM)** as a learned world-model component. The drone-facing API
+is exposed through the `drone_ai` package; LeWM remains the internal component
+for pixel-to-latent prediction, short-horizon candidate scoring, latent rollout,
+and surprise/anomaly estimation.
 
-[Lucas Maes*](https://x.com/lucasmaes_), [Quentin Le Lidec*](https://quentinll.github.io/), [Damien Scieur](https://scholar.google.com/citations?user=hNscQzgAAAAJ&hl=fr), [Yann LeCun](https://yann.lecun.com/) and [Randall Balestriero](https://randallbalestriero.github.io/)
+The stack is intentionally layered:
 
-**Abstract:** Joint Embedding Predictive Architectures (JEPAs) offer a compelling framework for learning world models in compact latent spaces, yet existing methods remain fragile, relying on complex multi-term losses, exponential moving averages, pretrained encoders, or auxiliary supervision to avoid representation collapse. In this work, we introduce LeWorldModel (LeWM), the first JEPA that trains stably end-to-end from raw pixels using only two loss terms: a next-embedding prediction loss and a regularizer enforcing Gaussian-distributed latent embeddings. This reduces tunable loss hyperparameters from six to one compared to the only existing end-to-end alternative. With ~15M parameters trainable on a single GPU in a few hours, LeWM plans up to 48× faster than foundation-model-based world models while remaining competitive across diverse 2D and 3D control tasks. Beyond control, we show that LeWM's latent space encodes meaningful physical structure through probing of physical quantities. Surprise evaluation confirms that the model reliably detects physically implausible events.
+- `drone_ai.AutonomyKit` orchestrates candidate generation, safety filtering,
+  world-model scoring, optional flight-controller handoff, and mission logging.
+- `drone_ai.LeWMWorldModelPlanner` adapts trained LeWM checkpoints to the drone
+  planner interface.
+- `drone_ai.SafetySupervisor` gates every proposed movement setpoint before it
+  can reach PX4, ArduPilot, or another flight-controller adapter.
+- `drone_ai.MissionLog` records auditable decision traces.
+- `ground_station` provides a Vite/React operator dashboard for the reference
+  platform and evidence pipeline.
+
+LeWM does not own stabilization, direct motor control, operator authorization,
+payload release, weapon release, target engagement, or safety interlocks.
+
+## Quick Start
+
+Run the source-tree Autonomy Kit demo without a LeWM checkpoint:
+
+```bash
+python3 examples/canadian_defence_autonomy_kit.py
+```
+
+Run the checkpoint-backed Autonomy Kit demo with the Hugging Face mirror:
+
+```bash
+uv venv --python=3.10
+source .venv/bin/activate
+uv pip install "stable-worldmodel[train,env]" huggingface_hub
+python3 examples/checkpoint_backed_drone_demo.py --repo-id quentinll/lewm-pusht
+```
+
+Use the public package namespace:
+
+```python
+from drone_ai import (
+    AutonomyKit,
+    HeuristicWorldModelPlanner,
+    LeWMCheckpointSpec,
+    SafetySupervisor,
+    load_hf_lewm_world_model_planner,
+)
+```
+
+Architecture docs:
+
+- `docs/repo_architecture.md` explains the drone AI repo layout.
+- `docs/lewm_component.md` explains the LeWM component boundary.
+- `docs/canadian_defence_full_stack.md` explains the Canadian defence Autonomy
+  Kit and reference platform track.
+
+Ground-station UI:
+
+```bash
+cd ground_station
+npm install
+npm run dev
+```
+
+PX4 VTOL simulation integration:
+
+- `integrations/aas_ros2/` provides a ROS2 overlay for running `drone_ai`
+  against a local `aerial-autonomy-stack` PX4 VTOL simulation.
+- `scripts/prepare_aas_ros2_overlay.sh` applies the AAS dynamic-setpoint patch
+  and links the overlay into the AAS aircraft workspace.
+- `docs/aerial_autonomy_stack_integration.md` documents Ubuntu GPU setup,
+  runtime topics, operator approval, and smoke tests.
+
+## LeWM Component
+
+LeWorldModel is retained in this repo as the learned world-model component.
+The original LeWM implementation lives in `jepa.py`, `module.py`, `train.py`,
+and `eval.py`, with training/evaluation configs under `config/train` and
+`config/eval`.
+
+Original LeWM authors:
+[Lucas Maes*](https://x.com/lucasmaes_), [Quentin Le Lidec*](https://quentinll.github.io/), [Damien Scieur](https://scholar.google.com/citations?user=hNscQzgAAAAJ&hl=fr), [Yann LeCun](https://yann.lecun.com/) and [Randall Balestriero](https://randallbalestriero.github.io/).
+
+LeWM summary: Joint Embedding Predictive Architectures (JEPAs) learn compact
+latent world models. LeWM trains end-to-end from raw pixels with a next-embedding
+prediction loss and a Gaussian latent regularizer, then supports fast planning
+and surprise detection in latent space.
 
 <p align="center">
    <b>[ <a href="https://arxiv.org/pdf/2603.19312v1">Paper</a> | <a href="https://huggingface.co/collections/quentinll/lewm">Checkpoints &amp; Data</a> | <a href="https://le-wm.github.io/">Website</a> ]</b>
@@ -26,14 +109,14 @@ If you find this code useful, please reference it in your paper:
 }
 ```
 
-## Using the code
-This codebase builds on [stable-worldmodel](https://github.com/galilai-group/stable-worldmodel) for environment management, planning, and evaluation, and [stable-pretraining](https://github.com/galilai-group/stable-pretraining) for training. Together they reduce this repository to its core contribution: the model architecture and training objective.
+## Using the LeWM component
+The LeWM component builds on [stable-worldmodel](https://github.com/galilai-group/stable-worldmodel) for environment management, planning, and evaluation, and [stable-pretraining](https://github.com/galilai-group/stable-pretraining) for training.
 
 **Installation:**
 ```bash
 uv venv --python=3.10
 source .venv/bin/activate
-uv pip install stable-worldmodel[train,env]
+uv pip install "stable-worldmodel[train,env]"
 ```
 
 ## Data
@@ -83,6 +166,62 @@ python eval.py --config-name=pusht.yaml policy=pusht/lewm
 # ✗ incorrect
 python eval.py --config-name=pusht.yaml policy=pusht/lewm_object.ckpt
 ```
+
+## Drone autonomy integration
+
+The `drone_ai` package productizes LeWM as a guarded component in a drone
+autonomy stack. It adds:
+
+- typed drone interfaces for observations, action candidates, safety decisions,
+  operator inputs, and mission log records
+- an `AutonomyKit` orchestration loop for candidate generation, safety filtering,
+  world-model scoring, optional flight-controller handoff, and mission logging
+- a `LeWMWorldModelPlanner` adapter exposing `score_action_candidates`,
+  `rollout`, and `surprise`
+- a `SafetySupervisor` that clips or rejects learned action proposals before
+  PX4/ArduPilot receives setpoints
+- `VelocityLatticeSampler`, `HeuristicWorldModelPlanner`, and
+  `DryRunFlightController` helpers for source-tree demos and bench tests
+- append-only `MissionLog` JSONL records with hash chaining for audit review
+- drone AI and Canadian defence configurations at
+  `config/drone_ai/autonomy_kit.yaml` and `config/drone/canadian_defence.yaml`
+
+The integration layer is non-kinetic by default. Kinetic-support contexts can be
+represented for mobility-only tasks, but this package blocks effects commands
+such as autonomous target engagement, payload release, and weapon release. LeWM
+remains advisory and does not replace the flight controller, safety supervisor,
+operator, or mission system.
+
+```bash
+python3 examples/canadian_defence_autonomy_kit.py
+```
+
+See `docs/canadian_defence_full_stack.md` for the dual-track Autonomy Kit and
+Canadian Reference Drone Platform architecture.
+
+### Canadian Reference Drone Platform prototype
+
+The reference-platform v1 packages the autonomy kit with a small VTOL under
+25 kg, configurable payload slots, default EO/IR + depth payloads, a secure
+data-pipeline manifest, support tiers, and BVLOS/L1C evidence scaffolding. It is
+an evidence-readiness prototype only; it does not claim Transport Canada
+approval and it must not store classified or controlled technical data in this
+repo.
+
+```bash
+python3 examples/canadian_reference_platform_demo.py
+```
+
+The operator ground-station demo lives in `ground_station/`:
+
+```bash
+cd ground_station
+npm install
+npm run dev
+```
+
+If the local volume is low on free space, install/build may fail before the
+frontend dependencies are available.
 
 ## Pretrained Checkpoints
 
@@ -179,6 +318,24 @@ PY
 ```
 
 After conversion, load via `swm.policy.AutoCostModel('pusht/lewm')` as usual.
+
+The drone adapter can load the same HF mirror directly for a source-tree smoke
+test without converting to `_object.ckpt`:
+
+```bash
+python3 examples/checkpoint_backed_drone_demo.py \
+  --repo-id quentinll/lewm-pusht \
+  --local-dir $STABLEWM_HOME/hf_pusht
+```
+
+To run the integration test path that scores drone candidates with the real
+checkpoint:
+
+```bash
+LEWM_RUN_CHECKPOINT_TEST=1 \
+LEWM_CHECKPOINT_DIR=$STABLEWM_HOME/hf_pusht \
+python3 -m unittest tests.test_checkpoint_backed_planner
+```
 
 ## Contact & Contributions
 Feel free to open [issues](https://github.com/lucas-maes/le-wm/issues)! For questions or collaborations, please contact `lucas.maes@mila.quebec`

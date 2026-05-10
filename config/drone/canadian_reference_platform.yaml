@@ -1,0 +1,100 @@
+offering:
+  name: Canadian Reference Drone Platform
+  version: 0.1.0
+  posture: non_kinetic_classified_path_scaffold
+  approval_claim: none
+
+airframe:
+  identifier: crdp-vtol-small-v1
+  class: small_rpas_under_25kg
+  baseline: small_vtol
+  max_takeoff_weight_kg: 24.9
+  propulsion: electric_vtol_fixed_wing_transition
+  flight_controller: px4_or_ardupilot
+  operating_modes:
+    - manual
+    - assisted
+    - advisory
+    - safety_filtered_autonomy
+  endurance_min: 90
+  cruise_speed_mps: 22
+  payload_capacity_kg: 2.2
+
+payload_architecture:
+  approach: configurable_slots_with_default_eo_ir_depth_profile
+  bays:
+    - identifier: nose-gimbal
+      max_mass_kg: 1.2
+      max_power_w: 35
+      interfaces: [ethernet, serial, isolated_12v]
+    - identifier: belly-depth
+      max_mass_kg: 0.8
+      max_power_w: 25
+      interfaces: [usb3, ethernet, isolated_12v]
+  default_payloads:
+    - identifier: eo-ir-gimbal
+      type: configurable_sensor
+      data_products: [rgb_video, thermal_video, payload_health]
+      autonomy_roles: [operator_awareness, anomaly_review, non_kinetic_isr]
+      classification_ceiling: protected_b
+    - identifier: depth-range-module
+      type: configurable_sensor
+      data_products: [range_points, obstacle_metadata, sensor_health]
+      autonomy_roles: [containment_monitoring, daa_assumption_support]
+      classification_ceiling: protected_b
+
+ground_station:
+  implementation: react_vite_demo
+  roles:
+    - pilot_in_command
+    - payload_operator
+    - safety_observer
+  required_surfaces:
+    - mission_map
+    - aircraft_health
+    - payload_health
+    - autonomy_recommendation
+    - c2_lost_link_status
+    - secure_pipeline_status
+    - evidence_readiness_matrix
+    - mission_log_verification
+
+secure_data_pipeline:
+  residency: canada_by_default
+  allowed_labels: [unclassified, protected_a, protected_b]
+  blocked_labels: [classified, controlled_goods, secret, top_secret]
+  encryption_required: true
+  export_review_required: true
+  classified_handling: external_secure_facility_only
+  review_gates:
+    - hash_chain_verification
+    - model_provenance_review
+    - export_control_review
+    - audit_log_review
+    - controlled_goods_screen
+    - classified_network_exclusion
+
+qualification_evidence:
+  target: small_vtol_under_25kg_bvlos_l1c_readiness
+  public_baseline:
+    - standard_922_08_containment
+    - standard_922_09_c2_link_lost_link
+    - standard_922_10_detect_alert_avoid_assumptions
+    - standard_922_11_control_station
+    - standard_922_12_environmental_envelope
+  release_statement: evidence_readiness_only_not_transport_canada_approval
+
+support_model:
+  tiers:
+    - field_operator_support
+    - autonomy_engineering_support
+    - secure_program_support
+  training:
+    - operator_ground_school
+    - maintenance_orientation
+    - data_handling_briefing
+  maintenance_intervals:
+    - preflight
+    - postflight
+    - 25_flight_hours
+    - payload_change

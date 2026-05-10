@@ -1,0 +1,5 @@
+rasterio
+pyogrio
+pyproj
+shapely
+numpy

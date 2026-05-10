@@ -1,0 +1,48 @@
+repo_identity: drone_ai_autonomy_kit
+world_model_component: lewm
+
+public_namespace: drone_ai
+compat_namespace: lewm_drone
+
+runtime:
+  kit_class: drone_ai.AutonomyKit
+  planner_adapter: drone_ai.LeWMWorldModelPlanner
+  bench_planner: drone_ai.HeuristicWorldModelPlanner
+  candidate_sampler: drone_ai.VelocityLatticeSampler
+  safety_supervisor: drone_ai.SafetySupervisor
+  mission_log: drone_ai.MissionLog
+  dry_run_controller: drone_ai.DryRunFlightController
+
+lewm_component:
+  role:
+    - score_short_horizon_action_candidates
+    - predict_latent_rollouts
+    - estimate_surprise_anomaly
+  files:
+    - jepa.py
+    - module.py
+    - train.py
+    - eval.py
+  adapter_methods:
+    - score_action_candidates
+    - rollout
+    - surprise
+
+autonomy_boundaries:
+  flight_controller_owns:
+    - stabilization
+    - failsafes
+    - return_to_launch
+    - manual_override
+  safety_supervisor_owns:
+    - geofence
+    - altitude_speed_yaw_limits
+    - battery_and_comms_limits
+    - operator_authority
+    - effect_command_blocking
+  lewm_does_not_own:
+    - direct_motor_control
+    - autonomous_target_selection
+    - payload_release
+    - weapon_release
+    - target_engagement

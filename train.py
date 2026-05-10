@@ -11,12 +11,15 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from jepa import JEPA
+from lewm_drone.geo_world_model import coerce_model_inputs
 from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
 def lejepa_forward(self, batch, stage, cfg):
     """encode observations, predict next states, compute losses."""
+
+    batch = dict(coerce_model_inputs(batch))
 
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
